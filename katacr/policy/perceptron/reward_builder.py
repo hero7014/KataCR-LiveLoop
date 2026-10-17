@@ -1,4 +1,5 @@
 import numpy as np
+import time
 from katacr.ocr_text.paddle_ocr import OCR
 from katacr.yolov8.custom_result import CRResults
 from katacr.constants.label_list import unit2idx
@@ -18,8 +19,10 @@ MAX_DELTA_HP = 1600
 ELIXIR_OVER_FRAME = 10  # 0.1 * 5 = 1 sec
 
 class RewardBuilder:
-  def __init__(self, ocr: OCR = None):
+  def __init__(self, ocr: OCR = None, ocr_interval: int = 1, double_read: bool = False):
     self.ocr = OCR(lang='en') if ocr is None else ocr
+    self.ocr_interval = max(int(ocr_interval), 1)
+    self.double_read = double_read
     self.reset()
   
   def reset(self):
@@ -31,10 +34,11 @@ class RewardBuilder:
     self.last_king_tower_destroy_frame = np.full((2,), -1, np.int32)
     self.frame_count = 0
     self.time = 0
+    self.dt = {}
   
   def _ocr_hp(self, xyxy, target_size):
     img = extract_img(self.img, xyxy, target_size=target_size)
-    imgs = [img, img[...,::-1]]
+    imgs = [img, img[...,::-1]] if self.double_read else [img]
     results = self.ocr(imgs, det=False)[0]
     # print(results)  # DEBUG
     # cv2.imshow('img', img[...,::-1])
@@ -53,6 +57,8 @@ class RewardBuilder:
       # cv2.imshow('img', img[...,::-1])
       # cv2.waitKey(0)
       nums.append(num)
+    if len(nums) == 1:
+      return nums[0]
     if np.mean(nums) == nums[0]: return nums[0]
     return -1
   
@@ -78,11 +84,20 @@ class RewardBuilder:
     return np.array(img)[...,::-1]
   
   def get_reward(self, verbose=False):
+    profile = {}
+    t = time.perf_counter()
     now_hp_tower = np.full((2, 2), -1, np.int32)
     now_hp_king_tower = np.full((2,), -1, np.int32)
     ### King Tower ###
     get_unit_box = lambda unit: self.box[self.box[:,-2] == unit2idx[unit]]
     king_tower_bar_box = get_unit_box('king-tower-bar')
+    profile['setup'] = time.perf_counter() - t
+    t = time.perf_counter()
+    has_hp_baseline = np.any(self.hp_tower != -1) or np.any(self.hp_king_tower != -1)
+    if self.ocr_interval > 1 and has_hp_baseline and self.frame_count % self.ocr_interval != 0:
+      profile['skip_interval'] = time.perf_counter() - t
+      self.dt['get_reward'] = profile
+      return 0
     # assert len(king_tower_bar_box) <= 2
     if len(king_tower_bar_box):
       for b in king_tower_bar_box:
@@ -99,6 +114,8 @@ class RewardBuilder:
             print(f"Warning(reward): (time={self.time}) king-tower id={b[-4]}, old_hp-ocr_hp={delta}'s abs {MAX_DELTA_HP=}, ignore it")
             hp = -1
         now_hp_king_tower[bel] = hp
+    profile['king_hp_ocr'] = time.perf_counter() - t
+    t = time.perf_counter()
     # check king-tower is destroied
     king_tower_box = get_unit_box('king-tower')
     frame = self.last_king_tower_destroy_frame
@@ -110,6 +127,8 @@ class RewardBuilder:
           now_hp_king_tower[i] = 0
       else:
         frame[i] = self.frame_count
+    profile['king_destroy_check'] = time.perf_counter() - t
+    t = time.perf_counter()
     ### Tower ###
     tower_bar_box = get_unit_box('tower-bar')
     for b in tower_bar_box:
@@ -127,6 +146,8 @@ class RewardBuilder:
           print(f"Warning(reward): (time={self.time}) tower id={b[-4]}, old_hp-ocr_hp={delta}'s abs > {MAX_DELTA_HP=}, ignore it")
           hp = -1
       now_hp_tower[i,j] = hp
+    profile['tower_hp_ocr'] = time.perf_counter() - t
+    t = time.perf_counter()
     # check tower is destroied
     tower_box = np.concatenate([get_unit_box(name) for name in except_king_tower_unit_list], 0)
     for b in tower_box:
@@ -146,6 +167,8 @@ class RewardBuilder:
           frame[i] = self.frame_count
         # if self._has_emote(XYXY_TOWER[i][j]):  # DEBUG
         #   print("Has emote in tower-patch", i, j)
+    profile['tower_destroy_check'] = time.perf_counter() - t
+    t = time.perf_counter()
     # print("Last tower destroy time:", self.last_tower_destroy_time)
     ### Calculate ###
     reward = {'tower': 0, 'king-tower': 0, 'r_': 0, 'elixir': 0}
@@ -193,6 +216,8 @@ class RewardBuilder:
     else:
       self.last_elixir_over_frame = None
     total_reward = sum(reward.values())
+    profile['calculate'] = time.perf_counter() - t
+    self.dt['get_reward'] = profile
     if verbose:
       print(f"Time={self.time}, Frame={self.frame_count}, {reward=}, {total_reward=:.4f}")
     return total_reward

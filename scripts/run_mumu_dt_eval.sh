@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RUNTIME_ROOT="${KATACR_RUNTIME_ROOT:-$SCRIPT_ROOT}"
+SOURCE_ROOT="${KATACR_SOURCE_ROOT:-$RUNTIME_ROOT}"
+VENV_ROOT="${KATACR_VENV_ROOT:-$RUNTIME_ROOT/.venv}"
+RUNTIME_SITE="${KATACR_RUNTIME_SITE:-$VENV_ROOT/lib/python3.11/site-packages}"
+PYTHON_BIN="${KATACR_PYTHON_BIN:-$VENV_ROOT/bin/python}"
+NVIDIA_LIB_ROOT="${KATACR_NVIDIA_LIB_ROOT:-$VENV_ROOT/lib/python3.11/site-packages/nvidia}"
+
+MODEL_NAME="${KATACR_MODEL_NAME:-DT_4L_v0.8_golem_ai_cnn_blocks__nbc128__ep20__step50__0__20240519_224135}"
+LOAD_EPOCH="${KATACR_LOAD_EPOCH:-8}"
+BASE_RTG="${KATACR_BASE_RTG:-3.0}"
+MAX_ACTION_DELAY="${KATACR_MAX_ACTION_DELAY:-8}"
+
+export KATACR_INTERACT_SOURCE="${KATACR_INTERACT_SOURCE:-adb}"
+export KATACR_MUMU_SIMPLE_START="${KATACR_MUMU_SIMPLE_START:-1}"
+export KATACR_ADB="${KATACR_ADB:-adb}"
+export KATACR_ADB_SERIAL="${KATACR_ADB_SERIAL:-127.0.0.1:16384}"
+export KATACR_ADB_NORMALIZE="${KATACR_ADB_NORMALIZE:-resize_width}"
+export KATACR_TIME_WALLCLOCK_FALLBACK="${KATACR_TIME_WALLCLOCK_FALLBACK:-1}"
+export KATACR_ELIXIR_WALLCLOCK_FALLBACK="${KATACR_ELIXIR_WALLCLOCK_FALLBACK:-1}"
+export KATACR_MUMU_DEPLOY_CLAMP="${KATACR_MUMU_DEPLOY_CLAMP:-70,260,650,930}"
+export KATACR_LIVE_CARD_SMOOTHING="${KATACR_LIVE_CARD_SMOOTHING:-1}"
+export KATACR_ENFORCE_ELIXIR_CHECK="${KATACR_ENFORCE_ELIXIR_CHECK:-0}"
+
+export LD_LIBRARY_PATH="/usr/lib/wsl/lib:$NVIDIA_LIB_ROOT/cudnn/lib:$NVIDIA_LIB_ROOT/cublas/lib:$NVIDIA_LIB_ROOT/cuda_nvrtc/lib:${LD_LIBRARY_PATH:-}"
+export PYTHONPATH="$RUNTIME_SITE:$RUNTIME_ROOT:$SOURCE_ROOT/.venv/lib/python3.11/site-packages:${PYTHONPATH:-}"
+
+"$KATACR_ADB" connect "$KATACR_ADB_SERIAL" >/dev/null 2>&1 || true
+
+cd "$RUNTIME_ROOT"
+exec "$PYTHON_BIN" -u katacr/policy/offline/eval.py \
+  --model-name "$MODEL_NAME" \
+  --load-epoch "$LOAD_EPOCH" \
+  --rtg "$BASE_RTG" \
+  --max-action-delay "$MAX_ACTION_DELAY" \
+  --eval-num "${KATACR_EVAL_NUM:-1}" \
+  --show "${KATACR_SHOW:-False}" \
+  --save "${KATACR_SAVE:-True}" \
+  --save-decision-trace "${KATACR_SAVE_DECISION_TRACE:-True}" \
+  --verbose "${KATACR_VERBOSE:-True}" \
+  "$@"

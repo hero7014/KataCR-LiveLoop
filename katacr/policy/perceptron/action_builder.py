@@ -20,8 +20,12 @@ from katacr.policy.perceptron.utils import pixel2cell, LOW_ALPHA, edit_distance
 from katacr.ocr_text.paddle_ocr import OCR
 from katacr.classification.elixir.predict import ElixirClassifier
 from katacr.constants.card_list import card2elixir
+from katacr.policy.perceptron.card_state_smoother import (
+  CardStateSmoother, cards_hidden_by_smoothing, should_drop_duplicate_frame,
+  should_remember_unmatched_elixir)
 import cv2
 from pathlib import Path
+import os
 # path_root = Path(__file__).parents[3]
 # path_wrong_classify_images = path_root / "logs/wrong_classify"
 # path_wrong_classify_images.mkdir(exist_ok=True)
@@ -54,6 +58,7 @@ class ActionBuilder:
       self.elixir_classifier = None
     self.wrong_img_count = 0
     self.last_elixir_num = None
+    self.card_smoother = CardStateSmoother() if os.getenv("KATACR_LIVE_CARD_SMOOTHING", "0") == "1" else None
     self.reset()
   
   def reset(self):
@@ -66,6 +71,8 @@ class ActionBuilder:
     self.frame_count = 0
     self.last_empty_frame = [0] * 5
     self.elixir_mutation_frames = []  # memory last elixir mutation frame, make offset to current action, to make sure action time is correctly
+    if self.card_smoother is not None:
+      self.card_smoother.reset()
     # self.elixir_count = 0
   
   def _update_elixir(self):
@@ -76,13 +83,22 @@ class ActionBuilder:
   
   def _update_cards(self):
     self.deploy_cards = set()
+    if self.card_smoother is not None:
+      raw_cards = list(self.cards)
+      self.deploy_cards.update(cards_hidden_by_smoothing(raw_cards, self.cards_memory))
+      smoothed_cards = self.card_smoother.update(raw_cards)
+      if smoothed_cards != raw_cards and os.getenv("KATACR_CARD_SMOOTH_DEBUG", "0") == "1":
+        print(f"Card smoothing: raw={raw_cards}, smooth={smoothed_cards}")
+      self.cards[:] = smoothed_cards
     self.cards_memory[0] = self.cards[0]  # next card should correct
     from collections import Counter
     counter = Counter(self.cards)
     common = counter.most_common(1)[0]
     if not (common[1] <= 1 or common[0] == 'empty'):
-      print(f"Warning(action): wrong detection, two same card {common[0]} in {self.cards}, skip it")
-      return
+      action = "skip it" if self.card_smoother is None else "keep frame with live smoothing"
+      print(f"Warning(action): wrong detection, two same card {common[0]} in {self.cards}, {action}")
+      if should_drop_duplicate_frame(self.cards, live_smoothing=self.card_smoother is not None):
+        return
       # cv2.imshow("wrong", self.img[...,::-1])
       # cv2.waitKey(0)
     # print(f"Action(Time={self.time},frame={self.frame_count}): before {self.cards=}, {self.cards_memory=}, {self.deploy_cards=}")  # DEBUG
@@ -208,6 +224,9 @@ class ActionBuilder:
       if elixir_num >= 0: continue  # 0: noisy, 1: elixir-collector, 0.5, 1: elixir-golem
       if not len(self.deploy_cards):
         print(f"Warning(action): (time={self.time}) No deploy card for elixirs (id={elixir[:,-4]})")
+        if should_remember_unmatched_elixir(live_smoothing=self.card_smoother is not None):
+          self.elixirs.add(id)
+          self.elixir_history.put((id, self.time))
         continue
       self.elixirs.add(id)
       self.elixir_history.put((id, self.time))

@@ -4,10 +4,12 @@ sudo modprobe v4l2loopback
 scrcpy --v4l2-sink=/dev/video2 --no-video-playback
 """
 import cv2, time, subprocess, multiprocessing
+import os
 import katacr.build_dataset.constant as const
 from katacr.policy.perceptron.utils import cell2pixel, background_size
 from pathlib import Path
 from katacr.policy.env.sar_daemon import SARDaemon
+from katacr.policy.offline.action_filter import should_execute_with_delay
 from katacr.utils import colorstr
 from katacr.policy.env.utils import tap_screen
 
@@ -17,6 +19,14 @@ def ratio2name(img_size):
     if ratio[0] <= r <= ratio[1]:
       return name
   raise Exception(f"Don't know ratio: {r:.4f}")
+
+def parse_clamp(value):
+  if not value:
+    return None
+  parts = [int(x.strip()) for x in value.split(',')]
+  if len(parts) != 4:
+    raise ValueError(f"clamp must have 4 comma-separated integers, got {value!r}")
+  return tuple(parts)
 
 class InteractEnv:
   def __init__(self, show=True, save=False, verbose=False):
@@ -44,6 +54,8 @@ class InteractEnv:
     self.q_reset.put(SARDaemon.AUTO_START_NEXT_EPISODE if auto else SARDaemon.WAIT_FOR_NEXT_EPISODE)
     s, a, r, done, info = self.q_sar.get()
     self.img_size = info['img_size']
+    self.tap_offset = info.get('tap_offset', (0, 0))
+    self.tap_scale = info.get('tap_scale', (1, 1))
     self.dt.update(info['dt'])
     assert not done
     self._show_dt()
@@ -58,10 +70,11 @@ class InteractEnv:
       return xy
     params = const.part3_bbox_params[select]
     tap2part = params[0]+params[2]/2, params[1]+params[3]/2
-    tap_screen(get_xy(3, tap2part), img_size=self.img_size, delay=delay)
+    tap_screen(get_xy(3, tap2part), img_size=self.img_size, delay=delay, offset=self.tap_offset, scale=self.tap_scale, label=f"card{select}")
     params = cell2pixel(xy)
     tap2part = [params[i] / background_size[i] for i in range(2)]
-    tap_screen(get_xy(2, tap2part), img_size=self.img_size)
+    deploy_clamp = parse_clamp(os.getenv("KATACR_MUMU_DEPLOY_CLAMP"))
+    tap_screen(get_xy(2, tap2part), img_size=self.img_size, offset=self.tap_offset, scale=self.tap_scale, label="deploy", clamp=deploy_clamp)
 
   def step(self, action, max_delay=5, prob_img=None):
     """
@@ -72,16 +85,23 @@ class InteractEnv:
     """
     assert self.done, "self.done=True, need reset first!"
     act_time = None
+    action_executed = False
+    execution_skip_reason = None
     if prob_img is not None:
       self.q_prob_img.put(prob_img)
     if action[0]:
-      if (max_delay is None) or (len(action) == 3 or (len(action) == 4 and action[-1] <= max_delay)):
+      if should_execute_with_delay(action, max_delay):
         self._act(action[0], action[1:3])
         act_time = time.time()
+        action_executed = True
+      else:
+        execution_skip_reason = "delay"
     s, a, r, done, info = self.q_sar.get()
     while action[0] and not done and act_time is not None and info['timestamp'] < act_time:  # wait SAR after action complete
       s, a, r, done, info = self.q_sar.get()
     self.dt.update(info['dt'])
+    info['action_executed'] = action_executed
+    info['execution_skip_reason'] = execution_skip_reason
     self._show_dt()
     return s, a, r, done, info
 

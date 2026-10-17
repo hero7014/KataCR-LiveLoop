@@ -28,8 +28,18 @@ path_detectors = [
 ]
 
 class ComboDetector:
-  def __init__(self, path_detectors, show_conf=True, conf=0.7, iou_thre=0.6, tracker='bytetrack'):
+  def __init__(self, path_detectors, show_conf=True, conf=0.7, iou_thre=0.6, tracker='bytetrack', device=None, half=True):
+    self.torch_device, self.predict_device = self._resolve_device(device)
+    self.use_cuda = self.torch_device.type == 'cuda'
+    self.half = bool(half and self.use_cuda)
     self.models = [YOLO_CR(str(p)) for p in path_detectors]
+    for m in self.models:
+      m.to(self.torch_device)
+    self.cls_maps = [
+      torch.tensor([unit2idx.get(m.names[i], -1) for i in range(len(m.names))], device=self.torch_device)
+      for m in self.models
+    ]
+    self.dt = {}
     self.show_conf, self.conf = show_conf, conf
     self.iou_thre = iou_thre
     self.tracker = None
@@ -37,6 +47,21 @@ class ComboDetector:
       self.conf = 0.1
       self.tracker_cfg_path = str(path_root/'./katacr/yolov8/bytetrack.yaml')
       cr_on_predict_start(self, persist=True)
+
+  def _resolve_device(self, device):
+    if device is None:
+      device = 0 if torch.cuda.is_available() else 'cpu'
+    if isinstance(device, int):
+      return torch.device(f'cuda:{device}'), str(device)
+    if isinstance(device, str) and device.isdigit():
+      return torch.device(f'cuda:{device}'), device
+    torch_device = torch.device(device)
+    predict_device = str(torch_device.index or 0) if torch_device.type == 'cuda' else 'cpu'
+    return torch_device, predict_device
+
+  def _sync(self):
+    if self.use_cuda:
+      torch.cuda.synchronize(self.torch_device)
   
   def infer(self, x, pil=False):
     """
@@ -51,26 +76,56 @@ class ComboDetector:
         - get_data(): get box information `xyxy, (track_id), conf, cls, bel`
         - show_box(verbose=False, show_conf=False, ...): return image with box (np.ndarray)
     """
+    dt = {}
     if pil: x = x[..., ::-1]  # RGB -> BGR
-    results = [m.predict(x, verbose=False, conf=self.conf)[0] for m in self.models]
+    results = []
+    for i, m in enumerate(self.models):
+      self._sync()
+      t = time.perf_counter()
+      results.append(m.predict(
+        x, verbose=False, conf=self.conf,
+        device=self.predict_device, half=self.half)[0])
+      self._sync()
+      dt[f'model{i}'] = time.perf_counter() - t
     preds = []
-    for p in results:
+    t = time.perf_counter()
+    for model_idx, p in enumerate(results):
       boxes = p.orig_boxes.clone()
-      for i in range(len(boxes)):
-        boxes[i, 5] = unit2idx[p.names[int(boxes[i, 5])]]
-        preds.append(boxes[i])
+      if len(boxes):
+        cls_map = self.cls_maps[model_idx].to(boxes.device)
+        boxes[:, 5] = cls_map[boxes[:, 5].long()].to(boxes.dtype)
+        boxes = boxes[boxes[:, 5] >= 0]
+        if len(boxes):
+          preds.append(boxes)
+    self._sync()
+    dt['remap'] = time.perf_counter() - t
+    t = time.perf_counter()
     if not preds:
-      preds = torch.zeros(0, 7)
+      preds = torch.zeros(0, 7, device=self.torch_device)
     else:
       preds = torch.cat(preds, 0).reshape(-1, 7)
-    i = torchvision.ops.nms(preds[:, :4], preds[:, 4], iou_threshold=self.iou_thre)
-    preds = preds[i]
+    self._sync()
+    dt['concat'] = time.perf_counter() - t
+    t = time.perf_counter()
+    if len(preds):
+      i = torchvision.ops.nms(preds[:, :4], preds[:, 4], iou_threshold=self.iou_thre)
+      preds = preds[i]
+    self._sync()
+    dt['nms'] = time.perf_counter() - t
+    t = time.perf_counter()
     # self.result will be used in `cr_on_predict_postprocess_end`
     self.result = CRResults(x, path="", names=idx2unit, boxes=preds)
+    dt['result'] = time.perf_counter() - t
+    t = time.perf_counter()
     if self.tracker is not None:
       cr_on_predict_postprocess_end(self, persist=True)
+    dt['tracker'] = time.perf_counter() - t
+    t = time.perf_counter()
     data = self.result.get_data()
     self.result.boxes.data = data[~(((data[:,0]>390) & (data[:,3]<120)) | ((data[:,2]<280) & (data[:,3]<80)))]
+    dt['filter'] = time.perf_counter() - t
+    dt['total'] = sum(dt.values())
+    self.dt = dt
     return self.result
 
   def predict(self, source, show=False, save=True, video_interval=1):

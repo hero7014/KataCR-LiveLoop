@@ -27,6 +27,7 @@ from katacr.policy.perceptron.utils import extract_img, pixel2cell, cell2pixel, 
 from katacr.build_dataset.generation_config import except_king_tower_unit_list, except_spell_and_object_unit_list, spell_unit_list, object_unit_list
 from typing import List, Dict, Tuple
 import scipy
+import time
 from collections import Counter, defaultdict
 from katacr.ocr_text.paddle_ocr import OCR
 from katacr.constants.card_list import card2idx, unit2cards
@@ -76,6 +77,7 @@ class StateBuilder:
     self.bel_memory: Dict[int,Counter] = defaultdict(Counter)
     self.cls_memory: Dict[int,Counter] = defaultdict(Counter)
     self.deploy_history = dict()
+    self.dt = {}
   
   def _add_bar_item(self, bar_level=None, bar1=None, bar2=None, body=None):
     self.bar_items.append(BarItem(self, bar_level=bar_level, bar1=bar1, bar2=bar2, body=body))
@@ -202,6 +204,9 @@ class StateBuilder:
     for k, v in list(self.deploy_history.items()):
       if self.frame_count - v >= DEPLOY_HISTORY_PERSIST_FRAME:
         self.deploy_history.pop(k)
+    if not self.deploy_history:
+      self.text_info = np.empty((0, 3), np.int32)
+      return
     text_info = []
     result = self.ocr(self.img)[0]
     # if 28 <= self.frame_count <= 30:
@@ -331,30 +336,52 @@ class StateBuilder:
     self.img = self.arena.get_rgb()
     self.frame_count += 1
     # assert box.shape[-1] == 8, 
+    profile = {}
+    t = time.perf_counter()
     ### Step 0: Update belong memory ###
     self._update_bel_memory()
+    profile['bel_memory'] = time.perf_counter() - t
+    t = time.perf_counter()
     ### Step 1: Find text information ###
     self._find_text_info(deploy_cards)
+    profile['text_info'] = time.perf_counter() - t
+    t = time.perf_counter()
     ### Step 2: Build bar items ###
     self._build_bar_items()
+    profile['build_bar_items'] = time.perf_counter() - t
+    t = time.perf_counter()
     ### Step 3: Combine units and bar2 with their BarItem ###
     self._combine_bar_items()
+    profile['combine_bar_items'] = time.perf_counter() - t
+    t = time.perf_counter()
     ### Step 4: Update bar history ###
     self._update_bar_items_history()
+    profile['bar_history'] = time.perf_counter() - t
+    t = time.perf_counter()
     ### Step 5: Update class memory, if body exists ###
     self._update_cls_memory()
+    profile['cls_memory'] = time.perf_counter() - t
+    self.dt['update'] = profile
   
   def get_state(self, verbose=False):
+    profile = {}
+    t = time.perf_counter()
     state = {}
     # state['arena'] = self.img  # NOT NEED IT
     state['time'] = self.time
     state['unit_infos'] = []
+    profile['init'] = time.perf_counter() - t
+    t = time.perf_counter()
     for i in self.bar_items:
       info = i.get_unit_info(verbose=verbose)
       if info is not None:
         state['unit_infos'].append(info)
+    profile['unit_infos'] = time.perf_counter() - t
+    t = time.perf_counter()
     state['cards'] = [self.card2idx[c] for c in self.cards]  # next, card1~4
     state['elixir'] = self.elixir
+    profile['cards_elixir'] = time.perf_counter() - t
+    self.dt['get_state'] = profile
     return state
   
 class BarItem:

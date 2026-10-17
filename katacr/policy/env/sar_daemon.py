@@ -1,6 +1,7 @@
 import numpy as np
 from pathlib import Path
 import multiprocessing, cv2, time
+import os
 from katacr.build_dataset.utils.split_part import process_part
 from katacr.policy.env.utils import tap_screen
 from katacr.utils.ffmpeg.format_conversion import compress_video
@@ -28,8 +29,20 @@ class SARDaemon:
     self.sar_builder = SARBuilder()
     self.q_info.put({'idx2card': self.sar_builder.visual_fusion.classifier.idx2card, 'path_save_dir': path_save_dir})
     self.ocr = self.sar_builder.action_builder.ocr  # Share OCR with action text OCR
-    self.cap = cv2.VideoCapture(2)
-    assert self.cap.isOpened(), "The phone stream can't connect!"
+    self.source = os.getenv("KATACR_INTERACT_SOURCE", "camera")
+    self.tap_offset = (0, 0)
+    self.cap = None
+    if self.source == "adb":
+      from scripts.adb_probe import normalize_portrait_frame, screencap
+      self.adb_normalize = normalize_portrait_frame
+      self.adb_screencap = screencap
+      self.adb = os.getenv("KATACR_ADB", "adb")
+      self.adb_serial = os.getenv("KATACR_ADB_SERIAL", "127.0.0.1:7555")
+      self.target_ratio = float(os.getenv("KATACR_ADB_TARGET_RATIO", "2.16"))
+      self.adb_normalize_mode = os.getenv("KATACR_ADB_NORMALIZE", "resize_width")
+    else:
+      self.cap = cv2.VideoCapture(2)
+      assert self.cap.isOpened(), "The phone stream can't connect!"
     self.open_window = False
     self.vid_writer = None
     if self.save:
@@ -42,24 +55,78 @@ class SARDaemon:
   
   def _read_img(self):
     self.timestamp = time.time()
+    if self.source == "adb":
+      raw, _, _ = self.adb_screencap(self.adb, serial=self.adb_serial)
+      self.raw_img = raw
+      if self.adb_normalize_mode == "resize_width":
+        h, w = raw.shape[:2]
+        target_w = int(h / self.target_ratio)
+        img = cv2.resize(raw, (target_w, h), interpolation=cv2.INTER_AREA)
+        self.tap_offset = (0, 0)
+        self.tap_scale = (w / target_w, 1)
+      else:
+        img, norm_info = self.adb_normalize(raw, self.target_ratio)
+        self.tap_offset = (norm_info.get("crop_x0", 0), norm_info.get("crop_y0", 0))
+        self.tap_scale = (1, 1)
+      return img
     _, img = self.cap.read()
+    self.tap_offset = (0, 0)
+    self.tap_scale = (1, 1)
     return img
+
+  def _is_open(self):
+    return True if self.source == "adb" else self.cap.isOpened()
 
   def _wait_next_episode(self):
     """ Wait for entering one episode """
-    start_time = time.time()
-    while self.cap.isOpened():
+    if self.source == "adb" and os.getenv("KATACR_MUMU_SIMPLE_START", "0") == "1":
+      print("MuMu simple start: taking current frame as episode start.")
+      return self._read_img()
+    episode_start_time = time.time()
+    last_wait_log_time = episode_start_time
+    while self._is_open():
       img = self._read_img()
       t = self.ocr.process_part1(process_part(img, 1))
       ep_flag = self.ocr.process_center_texts(img)
+      if (
+        self.source == "adb"
+        and os.getenv("KATACR_MUMU_SIMPLE_START", "0") == "1"
+        and np.isfinite(t)
+        and 0 < t <= 180
+      ):
+        return img
       if ep_flag == self.ocr.START_EPISODE_FLAG and t < 10:
         return img
+      if self.source == "adb" and os.getenv("KATACR_MUMU_SIMPLE_START", "0") == "1":
+        try:
+          from scripts.adb_ui_flow import detect_page_state
+          ui_state = detect_page_state(getattr(self, "raw_img", img)).value
+        except Exception:
+          ui_state = None
+        if time.time() - episode_start_time > 4 and ui_state not in ("home", "post_match"):
+          return img
       time.sleep(0.05)
-      if time.time() - start_time > 2:
+      if time.time() - last_wait_log_time > 2:
         print("Wait for opening new episode...")
-        start_time = time.time()
+        last_wait_log_time = time.time()
 
   def _check_terminal(self):
+    if self.source == "adb" and os.getenv("KATACR_MUMU_SIMPLE_START", "0") == "1":
+      battle_time = getattr(self.sar_builder.state_builder, "time", None)
+      try:
+        from scripts.adb_ui_flow import detect_page_state
+        ui_state = detect_page_state(getattr(self, "raw_img", self.img)).value
+        min_terminal_time = int(os.getenv("KATACR_MUMU_MIN_TERMINAL_TIME", "20"))
+        if ui_state == "post_match" and battle_time is not None and battle_time >= min_terminal_time:
+          self.terminal = True
+          while not self.q_sar.empty(): self.q_sar.get()
+          return
+      except Exception:
+        pass
+      if battle_time is not None and battle_time > int(os.getenv("KATACR_MUMU_MAX_BATTLE_TIME", "190")):
+        self.terminal = True
+        while not self.q_sar.empty(): self.q_sar.get()
+      return
     if self.first_terminal_time is None:
       ep_flag = self.ocr.process_center_texts(self.img)
       if ep_flag == self.ocr.END_EPISODE_FLAG:
@@ -70,6 +137,14 @@ class SARDaemon:
         self.terminal = True
 
   def _start_new_episode(self):
+    if self.source == "adb" and os.getenv("KATACR_MUMU_SIMPLE_START", "0") == "1":
+      img = self._read_img()
+      t = self.ocr.process_part1(process_part(img, 1))
+      if np.isfinite(t) and 0 < t <= 180:
+        return
+      # Current MuMu lobby layout: tap the visible battle button and wait for the match to load.
+      tap_screen((360, 1000), relative=False, delay=3.0)
+      return
     # img_size = self.img.shape[:2][::-1]  # (1080, 2400)
     time.sleep(10)  # wait for OK button
     img_size = (1080, 2400)
@@ -96,6 +171,9 @@ class SARDaemon:
           # self.vid_writer_org = None
           # print("RELEASE mp4 videos!!!")
           compress_video(self.path_save_vid)
+        if self.terminal and self.q_reset.empty():
+          time.sleep(0.05)
+          continue
         self.terminal = False
         self.total_reward = 0
         reset = True
@@ -117,7 +195,8 @@ class SARDaemon:
       dt = results[1]
       self.count += 1
       if self.count % self.interval == 0:
-        info = {'dt': {}, 'timestamp': self.timestamp, 'img_size': self.img.shape[:2][::-1]}
+        info = {'dt': {}, 'timestamp': self.timestamp, 'img_size': self.img.shape[:2][::-1], 'tap_offset': self.tap_offset, 'tap_scale': self.tap_scale}
+        info['raw_cards'] = self.sar_builder.last_raw_cards
         info['dt']['sar_update'] = sum(dt)
         s, a, r, dt = self.sar_builder.get_sar(verbose=False)
         self.total_reward += r
