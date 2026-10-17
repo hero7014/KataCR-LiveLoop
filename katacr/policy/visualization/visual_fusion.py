@@ -5,6 +5,8 @@ from pathlib import Path
 from katacr.build_dataset.utils.split_part import process_part
 import cv2
 import numpy as np
+import time
+import os
 
 path_root = Path(__file__).parents[3]
 path_detectors = [
@@ -28,11 +30,36 @@ def draw_text(
     cv2.putText(img, text, (x, int(y + text_h + font_scale - 1)), font, font_scale, text_color, font_thickness)
 
 class VisualFusion:
-  def __init__(self, ocr_onnx=False, ocr_gpu=True):
+  def __init__(
+      self, ocr_onnx=False, ocr_gpu=True,
+      time_ocr_interval=1, elixir_ocr_interval=1
+    ):
     self.ocr = OCR(onnx=ocr_onnx, use_gpu=ocr_gpu, lang='en')
     self.yolo = ComboDetector(path_detectors)
     self.classifier = CardClassifier(path_classifier)
     self.open_window = False
+    self.dt = {}
+    self.time_ocr_interval = max(1, int(time_ocr_interval))
+    self.elixir_ocr_interval = max(1, int(elixir_ocr_interval))
+    self.reset_cache()
+
+  def reset_cache(self):
+    self.frame_count = 0
+    self.last_time = np.inf
+    self.wallclock_start = time.perf_counter()
+    self.last_elixir = None
+    self.has_time_cache = False
+    self.has_elixir_cache = False
+
+  def _should_run_ocr(self, name):
+    if name == 'time':
+      return self.frame_count % self.time_ocr_interval == 0 or not self.has_time_cache
+    if name == 'elixir':
+      return self.frame_count % self.elixir_ocr_interval == 0 or not self.has_elixir_cache
+    return True
+
+  def _wallclock_elixir(self):
+    return min(10, max(0, int(3 + (time.perf_counter() - self.wallclock_start) / 2.8)))
   
   def process(self, x, pil=False):
     """
@@ -46,6 +73,8 @@ class VisualFusion:
         cards (List[str]): {card_name0, card_name1, card_name2, card_name3, card_name4}. (Part3)
         elixir (int): The elixir we have. (Part3)
     """
+    profile = {}
+    t = time.perf_counter()
     self.parts = parts = []
     parts_pos = []
     for i in range(3):
@@ -54,12 +83,52 @@ class VisualFusion:
       parts_pos.append(box_params)
     parts_pos = np.array(parts_pos)
     self.parts_pos = (parts_pos.reshape(-1, 2) * np.array(x.shape[:2][::-1])).astype(np.int32).reshape(-1, 4)
-    time = self.ocr.process_part1(parts[0], pil=pil)
+    profile['split_parts'] = time.perf_counter() - t
+    self.frame_count += 1
+    if self._should_run_ocr('time'):
+      t = time.perf_counter()
+      battle_time = self.ocr.process_part1(parts[0], pil=pil)
+      profile['ocr_time'] = time.perf_counter() - t
+      if np.isfinite(battle_time):
+        self.last_time = battle_time
+      elif os.getenv("KATACR_TIME_WALLCLOCK_FALLBACK", "0") == "1":
+        battle_time = int(time.perf_counter() - self.wallclock_start)
+        self.last_time = battle_time
+      else:
+        battle_time = self.last_time
+      self.has_time_cache = True
+    else:
+      battle_time = self.last_time
+      profile['ocr_time'] = 0.0
+    t = time.perf_counter()
     arena = self.yolo.infer(parts[1], pil=pil)
+    profile['yolo'] = time.perf_counter() - t
+    for k, v in getattr(self.yolo, 'dt', {}).items():
+      profile[f'yolo.{k}'] = v
+    t = time.perf_counter()
     cards = self.classifier.process_part3(parts[2], pil=pil)
-    elixir = self.ocr.process_part3_elixir(parts[2], pil=pil)
+    profile['card_cls'] = time.perf_counter() - t
+    if self._should_run_ocr('elixir'):
+      t = time.perf_counter()
+      elixir = self.ocr.process_part3_elixir(parts[2], pil=pil)
+      profile['ocr_elixir'] = time.perf_counter() - t
+      if os.getenv("KATACR_ELIXIR_WALLCLOCK_FALLBACK", "0") == "1" and (elixir is None or elixir <= 0):
+        elixir = self._wallclock_elixir()
+        self.last_elixir = elixir
+      elif elixir is not None:
+        self.last_elixir = elixir
+      elif os.getenv("KATACR_ELIXIR_WALLCLOCK_FALLBACK", "0") == "1":
+        elixir = self._wallclock_elixir()
+        self.last_elixir = elixir
+      else:
+        elixir = self.last_elixir
+      self.has_elixir_cache = True
+    else:
+      elixir = self.last_elixir
+      profile['ocr_elixir'] = 0.0
+    self.dt = profile
     self.info = dict(
-      time=time, arena=arena, cards=cards, elixir=elixir,
+      time=battle_time, arena=arena, cards=cards, elixir=elixir,
       card2idx=self.classifier.card2idx, idx2card=self.classifier.idx2card,
       parts_pos=self.parts_pos)
     return self.info

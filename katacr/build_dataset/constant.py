@@ -20,7 +20,7 @@ path_logs.mkdir(exist_ok=True)
 path_features = root / "katacr/features"
 # path_videos = Path("/home/yy/Coding/datasets/CR/fast_pig_2.6")
 # path_dataset = Path("/home/wty/Coding/datasets/CR")
-path_dataset = Path(os.getenv("KATACR_DATASET_PATH", "/home/yy/Coding/datasets/Clash-Royale-Dataset"))
+path_dataset = Path(os.getenv("KATACR_DATASET_PATH", str(root / "data" / "Clash-Royale-Dataset")))
 # path_dataset = Path("/data/user/wutianyang/dataset/Clash-Royale-Dataset")
 # path_dataset = Path("/data/user/zhihengwu/Coding/dataset/Clash-Royale-Dataset")
 if not path_dataset.exists():
@@ -65,7 +65,7 @@ split_bbox_params = {  # format: [x_top_left, y_top_left, width, hight]
 }
 ratio = {
   'part2': (1.57, 1.58),  # 568x896
-  '2.16': (2.16, 2.17),  # 592x1280 oyassu
+  '2.16': (2.16, 2.18),  # 592x1280 oyassu, 720x1564 exports
   '2.22': (2.22, 2.23),  # 1080x2400 or 576x1280
   '2.13': (2.13, 2.14),  # 600x1280
 }

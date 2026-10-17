@@ -49,6 +49,10 @@ def process_part(img, part: int | str, playback: bool = False, resize=True, verb
     target_size = const.part_sizes[part]
   if playback: part += '_playback'
   name = ratio2name(img)
+  if name is None:
+    h, w = img.shape[:2]
+    known = ', '.join(f"{k}:{v[0]}-{v[1]}" for k, v in const.ratio.items())
+    raise ValueError(f"Unsupported image ratio {h / w:.4f} for shape {img.shape}; known ratios: {known}")
   part += '_' + name
   bbox_params = const.split_bbox_params[part]
   if type(bbox_params) == dict:

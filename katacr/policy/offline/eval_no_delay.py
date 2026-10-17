@@ -18,7 +18,7 @@ from katacr.utils import colorstr, Stopwatch
 from katacr.utils.ffmpeg.merge_videos import merge_videos_left_and_right
 from katacr.constants.card_list import card2elixir
 from katacr.policy.replay_data.data_display import GridDrawer
-import time
+import json, time
 from katacr.utils.csv_writer import CSVWriter
 
 MODEL_NAME = "StARformer_no_delay_2L_v0.8_golem_ai_cnn_blocks__nbc128__ep20__step50__0__20240520_205252"
@@ -42,6 +42,33 @@ def build_eval_output_dir(vid_path=None):
   path.mkdir(parents=True, exist_ok=True)
   return path
 
+def json_safe(value):
+  if isinstance(value, np.ndarray):
+    return value.tolist()
+  if isinstance(value, np.generic):
+    return value.item()
+  if isinstance(value, Path):
+    return str(value)
+  if isinstance(value, dict):
+    return {str(k): json_safe(v) for k, v in value.items()}
+  if isinstance(value, (list, tuple)):
+    return [json_safe(v) for v in value]
+  return value
+
+class JSONLWriter:
+  def __init__(self, path):
+    self.path = Path(path)
+    self.path.parent.mkdir(parents=True, exist_ok=True)
+    self.f = self.path.open('w', encoding='utf-8')
+
+  def write(self, row):
+    self.f.write(json.dumps(json_safe(row), ensure_ascii=False, separators=(',', ':')) + '\n')
+    self.f.flush()
+
+  def close(self):
+    if not self.f.closed:
+      self.f.close()
+
 def pad_along_axis(array: np.ndarray, target_length: int, axis: int = 0) -> np.ndarray:
   """ This function would pad at the end of certain axis, https://stackoverflow.com/a/49766444 """
   pad_size = target_length - array.shape[axis]
@@ -57,14 +84,27 @@ class Evaluator:
 
   def __init__(
       self, path_weights, load_epoch=None, vid_path=None, show=True, save=False,
-      rtg=3., deterministic=True, verbose=False, show_predict=True, eval_num=None
+      rtg=3., deterministic=True, verbose=False, show_predict=True, eval_num=None,
+      fixed_window=True, reward_ocr_interval=10,
+      time_ocr_interval=3, elixir_ocr_interval=2,
+      save_video=False, save_video_interval=10,
+      save_frame_log=True
     ):
     self.base_rtg, self.deterministic = rtg, deterministic
     self.verbose, self.show_predict, self.eval_num = verbose, show_predict, eval_num
+    self.fixed_window = fixed_window
     self.show, self.save = show, save
+    self.save_frame_log = save_frame_log
     if vid_path is not None:
-      self.env = VideoEnv(vid_path, action_freq=2, show=show, verbose=verbose)
       self.path_save_dir = build_eval_output_dir(vid_path)
+      self.env = VideoEnv(
+        vid_path, action_freq=2, show=show, save=save, verbose=verbose,
+        reward_ocr_interval=reward_ocr_interval,
+        time_ocr_interval=time_ocr_interval,
+        elixir_ocr_interval=elixir_ocr_interval,
+        path_save_dir=self.path_save_dir,
+        save_video=save_video,
+        save_video_interval=save_video_interval)
     else:
       self.env = InteractEnv(show=show, save=save)
       self.path_save_dir = self.env.path_save_dir
@@ -73,7 +113,10 @@ class Evaluator:
     self._load_model(path_weights, load_epoch)
     self.vid_writer = None
     self.csv_writer = CSVWriter(self.path_save_dir / f"{self.model_name}_load{self.load_epoch}.csv", title=CSV_TITLE)
-  
+    self.frame_log_writer = None
+    if self.save and self.save_frame_log:
+      self.frame_log_writer = JSONLWriter(self.path_save_dir / f"{self.model_name}_load{self.load_epoch}_frames.jsonl")
+
   def _load_model(self, path_weights, load_epoch=None):
     print("Loading policy model...", end='')
     ckpt_mngr = CheckpointManager(str(path_weights))
@@ -131,35 +174,50 @@ class Evaluator:
       'pos': np.empty((B, l, 2), np.int32)
     }
     r, timestep = np.empty((B, l), np.float32), np.empty((B, l), np.int32)
-    self.model.predict(
+    jax.device_get(self.model.predict(
       self.state,
-      s, a, r, timestep, l, self.rng, self.deterministic)
+      s, a, r, timestep, np.array([l], np.int32), self.rng, self.deterministic))
+
+  def _pad_history(self, values, n_step):
+    recent = np.stack(values[-n_step:])
+    if recent.shape[0] == n_step:
+      return np.expand_dims(recent, 0)
+    padded = np.zeros((n_step, *recent.shape[1:]), dtype=recent.dtype)
+    if self.fixed_window:
+      padded[-recent.shape[0]:] = recent
+    else:
+      padded[:recent.shape[0]] = recent
+    return np.expand_dims(padded, 0)
   
   def get_action(self):
     n_step = self.n_step
     def pad(x):
-      x = np.expand_dims(np.stack(x[-n_step:]), 0)
-      return pad_along_axis(x, n_step, 1)
-    step_len = min(len(self.timestep), n_step)  # FIX BUG: Don't use len(self.s)
+      return self._pad_history(x, n_step)
+    step_len = n_step if self.fixed_window else min(len(self.timestep), n_step)
+    step_len_arg = np.array([step_len], np.int32)
     rng, self.rng = jax.random.split(self.rng)
     # for k, v in self.s.items():
     #   print(f"{k}: {pad(v).shape}")
     # for k, v in self.a.items():
     #   print(f"{k}: {pad(v).shape}")
     # print(pad(self.rtg).shape, pad(self.timestep).shape, step_len, rng, self.deterministic)
-    data = {
-      's': {k: pad(v) for k, v in self.s.items()},
-      'a': {k: pad(v) for k, v in self.a.items()},
-      'rtg': pad(self.rtg),
-      'timestep': pad(self.timestep),
-    }
-    action, logits_select, logits_pos = jax.device_get(self.model.predict(
+    profile = {}
+    t = time.perf_counter()
+    s = {k: pad(v) for k, v in self.s.items()}
+    a = {k: pad(v) for k, v in self.a.items()}
+    rtg = pad(self.rtg)
+    timestep = pad(self.timestep)
+    profile['build'] = time.perf_counter() - t
+    t = time.perf_counter()
+    predict_out = self.model.predict(
       self.state,
-      {k: pad(v) for k, v in self.s.items()},
-      {k: pad(v) for k, v in self.a.items()},
-      pad(self.rtg),
-      pad(self.timestep),
-      step_len, rng, self.deterministic))
+      s, a, rtg, timestep,
+      step_len_arg, rng, self.deterministic)
+    profile['dispatch'] = time.perf_counter() - t
+    t = time.perf_counter()
+    action, logits_select, logits_pos = jax.device_get(predict_out)
+    profile['device_get'] = time.perf_counter() - t
+    t = time.perf_counter()
     action = action[0]
     prob_select = np.exp(logits_select)[0]
     prob_select /= prob_select.sum()
@@ -168,6 +226,7 @@ class Evaluator:
     # if step_len == 30:
     #   np.save("/home/yy/Coding/GitHub/KataCR/logs/intercation/video1_eval_dataset_50.npy", data, allow_pickle=True)
     #   exit()
+    prob_img = None
     if self.show_predict:
       sel_drawer = GridDrawer(1, 5, size=(576, 50))
       for i in range(5):
@@ -197,6 +256,9 @@ class Evaluator:
       #     self.path_save_vid = self.path_save_dir / f"{self.episode}_predict.mp4"
       #     self.vid_writer = cv2.VideoWriter(str(self.path_save_vid), cv2.VideoWriter_fourcc(*'mp4v'), 10, (576, 896))
       #   self.vid_writer.write(img)
+    profile['postprocess'] = time.perf_counter() - t
+    if self.verbose:
+      print(colorstr("Time used (Policy detail):"), *[f"{k}={v*1e3:.1f}ms" for k, v in profile.items()])
     return action, prob_img
   
   # def _init_vid_writer(self):
@@ -223,22 +285,57 @@ class Evaluator:
       now_rtg, done = self.base_rtg, False
       self._add_sart(s, a, self.base_rtg, s['time'])
       while not done:
+        prev_s = s
         if s['elixir'] is not None: last_elixir = s['elixir']
         with self.sw[0]:
-          a, prob_img = self.get_action()
-        a = np.array(a)
-        card = self.idx2card[str(s['cards'][a[0]])]
-        if a[0] and card == 'empty':
-          print(f"Skip action, since card index {a[0]} is 'empty'")
-          a[0] = 0  # Skip
-        if a[0] and card2elixir[card] > last_elixir:
+          policy_action, prob_img = self.get_action()
+        policy_action = np.array(policy_action)
+        raw_policy_action = policy_action.copy()
+        card = self.idx2card[str(s['cards'][policy_action[0]])]
+        if policy_action[0] and card == 'empty':
+          print(f"Skip action, since card index {policy_action[0]} is 'empty'")
+          policy_action[0] = 0  # Skip
+        if policy_action[0] and card2elixir[card] > last_elixir:
           print(f"Skip action, since no enough elixir for card {card}={card2elixir[card]} > {last_elixir}")
-          a[0] = 0  # Skip
+          policy_action[0] = 0  # Skip
         with self.sw[1]:
-          s, _, r, done, info = self.env.step(a, max_delay=None, prob_img=prob_img)
+          s, target_action, r, done, info = self.env.step(policy_action, max_delay=None, prob_img=prob_img)
           # s, a, r, done = self.env.step(a)
-        if a[0]: use_actions += 1
-        a = {'card_id': a[0], 'xy': a[1:3] if a[0] != 0 else None}
+        if policy_action[0]: use_actions += 1
+        a = {'card_id': policy_action[0], 'xy': policy_action[1:3] if policy_action[0] != 0 else None}
+        if self.frame_log_writer is not None:
+          self.frame_log_writer.write({
+            'episode': self.episode,
+            'step_index': len(scores),
+            'visual_count': info.get('visual_count'),
+            'source_frame': info.get('source_frame'),
+            'total_frame': info.get('total_frame'),
+            'prev_state': {
+              'time': prev_s.get('time'),
+              'elixir': prev_s.get('elixir'),
+              'cards': prev_s.get('cards'),
+            },
+            'state': {
+              'time': s.get('time'),
+              'elixir': s.get('elixir'),
+              'cards': s.get('cards'),
+            },
+            'policy_action_raw': {
+              'card_id': raw_policy_action[0],
+              'xy': raw_policy_action[1:3],
+              'card_name': card,
+            },
+            'policy_action': a,
+            'target_action': target_action,
+            'reward': r,
+            'total_reward': info.get('total_reward'),
+            'done': done,
+            'timings': {
+              'policy': self.sw[0].dt,
+              'step': self.sw[1].dt,
+              'env': info.get('timings', {}),
+            },
+          })
         # print("Action:", a)
         # When use future action predict, a[0] in [1,2,3,4]
         if self.verbose:
@@ -247,6 +344,8 @@ class Evaluator:
         self._add_sart(s, a, now_rtg, s['time'])
         score = info['total_reward']
         scores.append(score)
+      if hasattr(self.env, 'close'):
+        self.env.close()
       print(f"score {score}, timestep {s['time']}")
       import matplotlib.pyplot as plt
       plt.plot(scores)
@@ -257,6 +356,8 @@ class Evaluator:
       # self._init_vid_writer()
       if self.eval_num is not None and self.episode == self.eval_num:
         break
+    if self.frame_log_writer is not None:
+      self.frame_log_writer.close()
     print(colorstr("Finish all evaluation!"))
 
 if __name__ == '__main__':
@@ -278,6 +379,22 @@ if __name__ == '__main__':
     help="Whether to use deterministic policy inference")
   parser.add_argument("--verbose", default=True, const=True, nargs='?', type=str2bool,
     help="Whether to print timing information")
+  parser.add_argument("--show-predict", default=True, const=True, nargs='?', type=str2bool,
+    help="Whether to build and display the policy probability image")
+  parser.add_argument("--fixed-window", default=True, const=True, nargs='?', type=str2bool,
+    help="Whether to left-pad history and always infer from the fixed final timestep")
+  parser.add_argument("--reward-ocr-interval", type=int, default=10,
+    help="Run tower HP reward OCR every N visual frames in offline video mode")
+  parser.add_argument("--time-ocr-interval", type=int, default=3,
+    help="Run battle time OCR every N visual frames in offline video mode")
+  parser.add_argument("--elixir-ocr-interval", type=int, default=2,
+    help="Run elixir OCR every N visual frames in offline video mode")
+  parser.add_argument("--save-video", default=False, const=True, nargs='?', type=str2bool,
+    help="Whether to save an annotated detection preview video")
+  parser.add_argument("--save-video-interval", type=int, default=10,
+    help="Write one annotated video frame every N visual frames")
+  parser.add_argument("--save-frame-log", default=True, const=True, nargs='?', type=str2bool,
+    help="Whether to save per-decision JSONL records with state, action, reward, and timings")
   args = parser.parse_args()
   path_weights = path_root / f"logs/Policy/{args.model_name}/ckpt"
   evaluator = Evaluator(
@@ -289,5 +406,13 @@ if __name__ == '__main__':
     deterministic=args.deterministic,
     eval_num=args.eval_num,
     verbose=args.verbose,
+    show_predict=args.show_predict,
+    fixed_window=args.fixed_window,
+    reward_ocr_interval=args.reward_ocr_interval,
+    time_ocr_interval=args.time_ocr_interval,
+    elixir_ocr_interval=args.elixir_ocr_interval,
+    save_video=args.save_video,
+    save_video_interval=args.save_video_interval,
+    save_frame_log=args.save_frame_log,
   )
   evaluator.eval()

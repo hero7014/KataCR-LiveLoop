@@ -132,7 +132,7 @@ class OCR:
     if results is None: return None
     recs = [info[1][0] for info in results]
     for i in recs:
-      for flag, texts in zip((self.START_EPISODE_FLAG, self.END_EPISODE_FLAG), (['fight'], text_features_episode_end)):
+      for flag, texts in zip((self.START_EPISODE_FLAG, self.END_EPISODE_FLAG), (['fight', '开战'], text_features_episode_end)):
         for j in texts:
           if j.lower() in i.lower():
             return flag

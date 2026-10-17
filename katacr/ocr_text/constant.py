@@ -1,3 +1,5 @@
+import os
+
 from katacr.utils.related_pkgs.utility import *
 
 image_width = 100
@@ -12,4 +14,4 @@ character_set = {
 # path_weights = "/home/wty/Coding/models/OCR/OCR-CRNN-0020-lite"
 # path_weights = "/home/wty/Coding/models/OCR/OCR-CRNN-BiLSTM-0020-lite"
 # path_weights = "/home/yy/Coding/models/OCR/OCR-CRNN-0020-lite"
-path_weights = "/home/yy/Coding/models/OCR/OCR-CRNN-BiLSTM-0020-lite"
+path_weights = os.getenv("KATACR_OCR_WEIGHTS", "weights/OCR-CRNN-BiLSTM-0020-lite")

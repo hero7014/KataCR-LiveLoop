@@ -5,6 +5,7 @@ scrcpy --v4l2-sink=/dev/video2 --no-video-playback
 
 (Automatically) evaluate model by interacting with mobile phone.
 """
+import json
 import os, sys
 from pathlib import Path
 os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
@@ -19,6 +20,8 @@ import numpy as np
 from katacr.utils import colorstr, Stopwatch
 from katacr.utils.ffmpeg.merge_videos import merge_videos_left_and_right
 from katacr.constants.card_list import card2elixir
+from katacr.policy.offline.action_filter import (
+  should_execute_with_delay, should_skip_for_elixir, should_skip_for_unreadable_hand)
 from katacr.policy.replay_data.data_display import GridDrawer
 import time
 from katacr.utils.csv_writer import CSVWriter
@@ -31,7 +34,10 @@ MODEL_NAME = "StARformer_2L_v0.8_golem_ai_cnn_blocks__nbc128__ep30__step50__0__2
 # path_weights = path_root / "logs/Policy/StARformer_2L_v0.8_golem_ai_cnn_blocks__nbc128__ep30__step100__0__20240513_114949/ckpt"
 # path_weights = path_root / "logs/Policy/StARformer_2L_v0.8_golem_ai_cnn_blocks__nbc128__ep30__step50__0__20240513_114808/ckpt"
 # path_weights = path_root / "logs/Policy/StARformer_2L_v0.6_golem_ai_cnn_blocks__nbc128__ep30__0__20240510_232848/ckpt"
-CSV_TITLE = ['episode', 'model_name', 'epoch', 'survival_time', 'total_reward', 'use_actions']
+CSV_TITLE = [
+  'episode', 'model_name', 'epoch', 'base_rtg', 'deterministic',
+  'survival_time', 'total_reward', 'use_actions'
+]
 
 def str2bool(x):
   return str(x).lower() in ['1', 'true', 'yes', 'y']
@@ -46,6 +52,33 @@ def build_eval_output_dir(vid_path=None):
     path = path / sanitize_output_name(Path(vid_path).stem)
   path.mkdir(parents=True, exist_ok=True)
   return path
+
+def json_safe(value):
+  if isinstance(value, np.ndarray):
+    return value.tolist()
+  if isinstance(value, np.generic):
+    return value.item()
+  if isinstance(value, Path):
+    return str(value)
+  if isinstance(value, dict):
+    return {str(k): json_safe(v) for k, v in value.items()}
+  if isinstance(value, (list, tuple)):
+    return [json_safe(v) for v in value]
+  return value
+
+class JSONLWriter:
+  def __init__(self, path):
+    self.path = Path(path)
+    self.path.parent.mkdir(parents=True, exist_ok=True)
+    self.file = self.path.open('w', encoding='utf-8')
+
+  def write(self, row):
+    self.file.write(json.dumps(json_safe(row), ensure_ascii=False, separators=(',', ':')) + '\n')
+    self.file.flush()
+
+  def close(self):
+    if not self.file.closed:
+      self.file.close()
 
 def pad_along_axis(array: np.ndarray, target_length: int, axis: int = 0) -> np.ndarray:
   """ This function would pad at the end of certain axis, https://stackoverflow.com/a/49766444 """
@@ -62,7 +95,8 @@ class Evaluator:
 
   def __init__(
       self, path_weights, load_epoch=None, vid_path=None, show=True, save=False,
-      rtg=3., deterministic=True, verbose=False, show_predict=True, eval_num=None
+      rtg=3., deterministic=True, verbose=False, show_predict=True, eval_num=None,
+      save_decision_trace=True, max_action_delay=8
     ):
     """
     Args:
@@ -76,10 +110,14 @@ class Evaluator:
       verbose (bool): If taggled, the processed time for each stage will be printed.
       show_predict (bool): If taggled, the prediction of policy model will be showed.
       eval_num (int): If given, evaluator will restart new epoch automatically in eval_num times.
+      save_decision_trace (bool): Save per-decision state, policy, guardrail, and action records.
+      max_action_delay (int): Skip future-action predictions above this delay; -1 disables the limit.
     """
     self.base_rtg, self.deterministic = rtg, deterministic
     self.verbose, self.show_predict, self.eval_num = verbose, show_predict, eval_num
     self.show, self.save = show, save
+    self.save_decision_trace = save_decision_trace
+    self.max_action_delay = None if max_action_delay < 0 else max_action_delay
     if vid_path is not None:
       self.env = VideoEnv(vid_path, action_freq=2, show=show, verbose=verbose)
       self.path_save_dir = build_eval_output_dir(vid_path)
@@ -88,9 +126,16 @@ class Evaluator:
       self.path_save_dir = self.env.path_save_dir
     self.rng = jax.random.PRNGKey(42)
     self.open_window = False
+    self.enforce_elixir_check = os.getenv("KATACR_ENFORCE_ELIXIR_CHECK", "1") != "0"
+    self.enforce_raw_hand_check = os.getenv("KATACR_ENFORCE_RAW_HAND_CHECK", "0") == "1"
     self._load_model(path_weights, load_epoch)
     self.vid_writer = None
     self.csv_writer = CSVWriter(self.path_save_dir / f"{self.model_name}_load{self.load_epoch}.csv", title=CSV_TITLE)
+    self.decision_trace_writer = None
+    if self.save and self.save_decision_trace:
+      path_trace = self.path_save_dir / f"{self.model_name}_load{self.load_epoch}_decision_trace.jsonl"
+      self.decision_trace_writer = JSONLWriter(path_trace)
+      print(f"Decision trace: {path_trace}")
   
   def _load_model(self, path_weights, load_epoch=None):
     print("Loading policy model...", end='')
@@ -251,27 +296,80 @@ class Evaluator:
       s, a, _ = self.env.reset(auto=self.eval_num is not None)
       self.episode += 1
       last_elixir = 0
+      previous_visual_cards = None
       now_rtg, done = self.base_rtg, False
       self._add_sart(s, a, self.base_rtg, s['time'])
       while not done:
+        prev_s = s
         if s['elixir'] is not None: last_elixir = s['elixir']
         with self.sw[0]:
           a, prob_img = self.get_action()
         a = np.array(a)
-        card = self.idx2card[str(s['cards'][a[0]])]
-        if a[0] and card == 'empty':
+        raw_policy_action = a.copy()
+        card = self.idx2card[str(s['cards'][a[0]])] if a[0] else None
+        guardrail = None
+        if a[0] and should_skip_for_unreadable_hand(
+            previous_visual_cards, enforce=self.enforce_raw_hand_check):
+          print("Skip action, since the raw visual hand is unreadable")
+          a[0] = 0  # Skip
+          guardrail = 'unreadable_hand'
+        elif a[0] and card == 'empty':
           print(f"Skip action, since card index {a[0]} is 'empty'")
           a[0] = 0  # Skip
-        if a[0] and card2elixir[card] > last_elixir:
+          guardrail = 'empty_card'
+        if a[0] and should_skip_for_elixir(card2elixir[card], last_elixir, enforce=self.enforce_elixir_check):
           print(f"Skip action, since no enough elixir for card {card}={card2elixir[card]} > {last_elixir}")
           a[0] = 0  # Skip
+          guardrail = 'elixir'
         if last_elixir == 10:
           a[-1] = 0  # NO delay
         with self.sw[1]:
-          s, _, r, done, info = self.env.step(a, max_delay=8, prob_img=prob_img)
+          s, _, r, done, info = self.env.step(a, max_delay=self.max_action_delay, prob_img=prob_img)
           # s, a, r, done = self.env.step(a)
-        if a[0]: use_actions += 1
+        action_executed = info.get('action_executed', should_execute_with_delay(a, max_delay=self.max_action_delay))
+        if action_executed: use_actions += 1
         a = {'card_id': a[0], 'xy': a[1:3] if a[0] != 0 else None, 'delay': a[3]}
+        if self.decision_trace_writer is not None:
+          self.decision_trace_writer.write({
+            'episode': self.episode,
+            'step_index': len(scores),
+            'base_rtg': self.base_rtg,
+            'max_action_delay': self.max_action_delay,
+            'now_rtg': now_rtg,
+            'deterministic': self.deterministic,
+            'previous_state': {
+              'time': prev_s.get('time'),
+              'elixir': prev_s.get('elixir'),
+              'cards': prev_s.get('cards'),
+            },
+            'visual_cards_before_action': previous_visual_cards,
+            'policy_action_raw': {
+              'card_id': raw_policy_action[0],
+              'xy': raw_policy_action[1:3],
+              'delay': raw_policy_action[3],
+              'card_name': card,
+            },
+            'guardrail': guardrail,
+            'executed_action': a,
+            'action_executed': action_executed,
+            'execution_skip_reason': info.get('execution_skip_reason'),
+            'target_action': _,
+            'state': {
+              'time': s.get('time'),
+              'elixir': s.get('elixir'),
+              'cards': s.get('cards'),
+            },
+            'visual_cards_after_step': info.get('raw_cards'),
+            'reward': r,
+            'total_reward': info.get('total_reward'),
+            'done': done,
+            'timings': {
+              'policy': self.sw[0].dt,
+              'step': self.sw[1].dt,
+              'env': info.get('timings', {}),
+            },
+          })
+        previous_visual_cards = info.get('raw_cards')
         # print("Action:", a)
         # When use future action predict, a[0] in [1,2,3,4]
         if self.verbose:
@@ -286,10 +384,15 @@ class Evaluator:
       plt.tight_layout()
       plt.savefig(str(self.path_save_dir / f"scores_{self.episode}.png"))
       plt.close()
-      self.csv_writer.write([self.episode, self.model_name, self.load_epoch, s['time'], score, use_actions])
+      self.csv_writer.write([
+        self.episode, self.model_name, self.load_epoch, self.base_rtg,
+        self.deterministic, s['time'], score, use_actions
+      ])
       # self._init_vid_writer()
       if self.eval_num is not None and self.episode == self.eval_num:
         break
+    if self.decision_trace_writer is not None:
+      self.decision_trace_writer.close()
     print(colorstr("Finish all evaluation!"))
 
 if __name__ == '__main__':
@@ -309,8 +412,14 @@ if __name__ == '__main__':
     help="Whether to save evaluation outputs")
   parser.add_argument("--deterministic", default=True, const=True, nargs='?', type=str2bool,
     help="Whether to use deterministic policy inference")
+  parser.add_argument("--rtg", type=float, default=3.0,
+    help="Initial return-to-go conditioning value for the Decision Transformer")
   parser.add_argument("--verbose", default=True, const=True, nargs='?', type=str2bool,
     help="Whether to print timing information")
+  parser.add_argument("--save-decision-trace", default=True, const=True, nargs='?', type=str2bool,
+    help="Whether to save per-decision JSONL records for live-run replay and diagnosis")
+  parser.add_argument("--max-action-delay", type=int, default=8,
+    help="Maximum future-action delay to execute; set -1 to disable the limit")
   args = parser.parse_args()
   path_weights = path_root / f"logs/Policy/{args.model_name}/ckpt"
   evaluator = Evaluator(
@@ -319,8 +428,11 @@ if __name__ == '__main__':
     vid_path=args.vid_path,
     show=args.show,
     save=args.save,
+    rtg=args.rtg,
     deterministic=args.deterministic,
     eval_num=args.eval_num,
     verbose=args.verbose,
+    save_decision_trace=args.save_decision_trace,
+    max_action_delay=args.max_action_delay,
   )
   evaluator.eval()
