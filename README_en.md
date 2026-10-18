@@ -1,21 +1,29 @@
 # KataCR LiveLoop
 
+[中文](README.md) | **English**
+
 An engineering adaptation of [wty-yy/KataCR](https://github.com/wty-yy/KataCR), organized for a reproducible **WSL2 + NVIDIA GPU + MuMu emulator** workflow.
 
 > This is a Fork/adaptation of the upstream KataCR project. The original policy models, datasets, research architecture, and core algorithm design belong to the upstream author. This repository focuses on runtime integration, performance work, diagnostics, and the MuMu live loop developed in this adaptation.
 
 ## Pipeline
 
-```text
-Video or MuMu screenshot
-    -> ROI cropping
-    -> YOLO detection + PaddleOCR
-    -> card, elixir, and arena state fusion
-    -> JAX/Orbax policy inference
-    -> action-to-screen coordinate mapping
-    -> ADB input to MuMu
-    -> logs, keyframes, and replay analysis
+```mermaid
+flowchart LR
+    A[Video / MuMu screenshot] --> B[ROI cropping]
+    B --> C[YOLOv8 detection]
+    B --> D[PaddleOCR]
+    B --> E[Card and elixir classification]
+    C --> F[Visual fusion]
+    D --> F
+    E --> F
+    F --> G[state / action / reward]
+    G --> H[JAX policy inference]
+    H --> I[Action filtering and mapping]
+    I --> J[Offline records or MuMu ADB taps]
 ```
+
+See [`docs/architecture.md`](docs/architecture.md) for the full module diagrams.
 
 The project keeps two entry points:
 
@@ -52,14 +60,15 @@ Do not commit personal absolute paths, model weights, videos, logs, or account i
 ## Documentation
 
 - [Public Windows launch guide](docs/windows_launch_public_zh-CN.md)
-- [Contribution ledger](docs/contributions.md)
-- [Public release checklist](docs/publication.md)
-- [Upstream PR map](docs/upstream_pr_map.md)
+- [Contribution boundary](docs/contributions_en.md)
+- [Architecture diagrams](docs/architecture.md)
+- [中文贡献边界](docs/contributions.md)
 
 ## Upstream and attribution
 
 - Upstream project: [wty-yy/KataCR](https://github.com/wty-yy/KataCR)
 - Upstream detection dataset: [Clash-Royale-Detection-Dataset](https://github.com/wty-yy/Clash-Royale-Detection-Dataset)
 - Upstream replay dataset: [Clash-Royale-Replay-Dataset](https://github.com/wty-yy/Clash-Royale-Replay-Dataset)
+- Upstream project history: [`UPDATE_LOGS.md`](UPDATE_LOGS.md)
 
 This repository follows the upstream MIT License. Use upstream code, models, datasets, and demonstration materials according to their licenses and author notices. The additional engineering code and documentation in this adaptation are maintained by `hero7014`; see [`docs/contributions.md`](docs/contributions.md) for the boundary.

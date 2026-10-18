@@ -14,9 +14,3 @@ yolov8n.pt
 *.deb
 desktop.ini
 before_*_backup.txt
-docs/project_handoff*
-docs/mumu_phase1_summary.md
-docs/mumu_live_chain_and_win_plan.md
-docs/perf_stage1.md
-docs/windows_launch_zh-CN.md
-docs/research/

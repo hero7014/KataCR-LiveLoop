@@ -1,21 +1,29 @@
 # KataCR LiveLoop
 
+**中文** | [English](README_en.md)
+
 基于 [wty-yy/KataCR](https://github.com/wty-yy/KataCR) 的个人工程适配线：把原项目的视觉感知与离线策略推理，整理为适用于 **WSL2 + NVIDIA GPU + MuMu 模拟器** 的可复现运行链路。
 
 > 这是一个基于上游 KataCR 的 Fork/适配项目。原始决策模型、训练数据、核心研究架构和主要算法设计归属于上游作者；本仓库重点记录本人的运行时适配、工程集成、性能优化、诊断工具和 MuMu 实时闭环实践。
 
 ## 链路
 
-```text
-视频或 MuMu 截屏
-    -> ROI 裁剪
-    -> YOLO 卡牌/单位检测 + PaddleOCR 文字识别
-    -> 手牌、圣水、战场状态融合
-    -> JAX/Orbax 策略推理
-    -> 动作坐标映射
-    -> ADB 点击 MuMu
-    -> 日志、关键帧和回放分析
+```mermaid
+flowchart LR
+    A[视频 / MuMu 截屏] --> B[ROI 裁剪]
+    B --> C[YOLOv8 检测]
+    B --> D[PaddleOCR]
+    B --> E[卡牌与圣水分类]
+    C --> F[视觉融合]
+    D --> F
+    E --> F
+    F --> G[state / action / reward]
+    G --> H[JAX 策略推理]
+    H --> I[动作过滤与坐标映射]
+    I --> J[离线记录或 MuMu ADB 点击]
 ```
+
+详细模块图见 [`docs/architecture.md`](docs/architecture.md)。
 
 工程同时保留两种入口：
 
@@ -53,9 +61,9 @@
 ## 入口与文档
 
 - [公开运行说明](docs/windows_launch_public_zh-CN.md)
-- [作者贡献清单](docs/contributions.md)
-- [公开发布清单](docs/publication.md)
-- [上游 PR 拆分图](docs/upstream_pr_map.md)
+- [贡献边界](docs/contributions.md)
+- [架构图](docs/architecture.md)
+- [English contribution boundary](docs/contributions_en.md)
 
 本地实验脚本包括离线评估、GPU 验证、ADB 探测、关键帧导出和回放生成。执行前请阅读脚本顶部参数和对应文档，并确认当前模拟器处于安全测试模式。
 
@@ -64,5 +72,6 @@
 - 原始项目：[wty-yy/KataCR](https://github.com/wty-yy/KataCR)
 - 原始目标检测数据集：[Clash-Royale-Detection-Dataset](https://github.com/wty-yy/Clash-Royale-Detection-Dataset)
 - 原始回放数据集：[Clash-Royale-Replay-Dataset](https://github.com/wty-yy/Clash-Royale-Replay-Dataset)
+- 上游项目历史记录：[`UPDATE_LOGS.md`](UPDATE_LOGS.md)
 
 本项目遵循上游 MIT License。上游代码、模型、数据集和展示结果应按各自许可证及原作者说明使用；本仓库新增的工程代码和文档由 `hero7014` 维护，具体边界以 [`docs/contributions.md`](docs/contributions.md) 为准。
